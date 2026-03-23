@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html lang="cs">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AudioFlow</title>
+
+<style>
+body{margin:0;background:#0d0d0d;color:white;font-family:-apple-system;}
+.header{padding:20px;font-size:24px;font-weight:bold;}
+.search{padding:0 20px 10px;}
+.search input{width:100%;padding:10px;border-radius:10px;border:none;background:#1a1a1a;color:white;}
+.now{padding:10px 20px;font-size:14px;opacity:0.8;}
+.container{padding:10px;display:grid;grid-template-columns: repeat(var(--cols,2),1fr);gap:15px;padding-bottom:140px;}
+.book{position:relative;aspect-ratio:1/1;background:#1a1a1a;border-radius:15px;overflow:hidden;}
+.book img{width:100%;height:100%;object-fit:cover;}
+.book-title{position:absolute;bottom:0;left:0;right:0;padding:10px;background:linear-gradient(transparent,rgba(0,0,0,0.85));}
+.book-cat{position:absolute;top:8px;left:8px;background:rgba(0,0,0,0.7);padding:5px 10px;border-radius:10px;font-size:12px;}
+.fav{position:absolute;top:8px;right:8px;font-size:18px;cursor:pointer;}
+#categoryTabs{display:flex;gap:10px;padding:10px 20px;overflow-x:auto;}
+.tab{padding:6px 12px;background:#1a1a1a;border-radius:10px;cursor:pointer;font-size:13px;opacity:0.7;}
+.tab.active{background:#3a86ff;opacity:1;}
+.player{position:fixed;bottom:0;left:0;right:0;background:#1a1a1a;padding:10px;}
+.progress{height:4px;background:#333;}
+.progress-bar{height:100%;background:#3a86ff;width:0%;}
+.controls{display:flex;gap:10px;}
+audio{flex:1;}
+.menu{position:fixed;background:#1a1a1a;border-radius:10px;padding:5px;display:none;flex-direction:column;z-index:1000;}
+.menu div{padding:8px 12px;cursor:pointer;}
+.menu div:hover{background:#333;}
+</style>
+</head>
+
+<body>
+
+<div class="header">🎧 AudioFlow</div>
+
+<div class="search">
+<input type="text" id="searchInput" placeholder="Hledat knihu...">
+</div>
+
+<div style="padding:0 20px 10px;">
+Velikost dlaždic
+<input type="range" min="1" max="6" id="gridSlider">
+</div>
+
+<div id="categoryTabs"></div>
+
+<div class="now" id="nowPlaying">Nic nehraje</div>
+
+<input type="file" id="fileInput" multiple webkitdirectory style="margin:10px">
+
+<div class="container" id="library"></div>
+
+<div id="menu" class="menu"></div>
+
+<div class="player">
+<div class="progress"><div id="progressBar" class="progress-bar"></div></div>
+<div class="controls">
+<button onclick="skip(-15)">⏪</button>
+<audio id="audio" controls></audio>
+<button onclick="skip(30)">⏩</button>
+</div>
+</div>
+
+<script>
+
+const categories=["Román","Detektivka","Sci-fi","Fantasy","Osobní rozvoj","Historie","Thriller","Ostatní"];
+let db=null,books=[],selectedCategory="Vše",currentUrl=null;
+
+const audio=document.getElementById("audio");
+
+/* 🍏 iPhone FIX */
+audio.setAttribute("playsinline", "");
+audio.setAttribute("webkit-playsinline", "");
+audio.preload="auto";
+
+const library=document.getElementById("library");
+const progressBar=document.getElementById("progressBar");
+const menu=document.getElementById("menu");
+const slider=document.getElementById("gridSlider");
+const searchInput=document.getElementById("searchInput");
+const nowPlaying=document.getElementById("nowPlaying");
+
+/* slider */
+slider.value=localStorage.getItem("cols")||2;
+document.documentElement.style.setProperty("--cols",slider.value);
+slider.oninput=()=>{
+localStorage.setItem("cols",slider.value);
+document.documentElement.style.setProperty("--cols",slider.value);
+render();
+};
+
+/* tabs */
+function renderTabs(){
+const tabs=document.getElementById("categoryTabs");
+tabs.innerHTML="";
+["⏱ Pokračovat","🕒 Naposled poslouchané","🆕 Naposled přidané","⭐ Oblíbené","Vše",...categories]
+.forEach(cat=>{
+const d=document.createElement("div");
+d.className="tab"+(cat===selectedCategory?" active":"");
+d.innerText=cat;
+d.onclick=()=>{selectedCategory=cat;renderTabs();render();};
+tabs.appendChild(d);
+});
+}
+
+/* DB */
+const req=indexedDB.open("AudioBooksDB",1);
+req.onupgradeneeded=e=>{
+db=e.target.result;
+db.createObjectStore("books",{keyPath:"name"});
+};
+req.onsuccess=e=>{
+db=e.target.result;
+loadBooks();
+};
+
+function saveBook(b){
+db.transaction("books","readwrite").objectStore("books").put(b);
+}
+
+/* load + auto continue */
+function loadBooks(){
+db.transaction("books","readonly").objectStore("books").getAll().onsuccess=e=>{
+books=e.target.result||[];
+
+renderTabs();
+render();
+
+/* auto continue */
+let last=[...books].sort((a,b)=>b.lastPlayed-a.lastPlayed)[0];
+
+if(last && last.chapters && (last.currentTime>5 || last.currentChapter>0)){
+setTimeout(()=>{try{play(last);}catch(e){}},500);
+}
+};
+}
+
+/* upload */
+fileInput.onchange=async function(){
+
+let grouped={};
+
+for(let f of this.files){
+
+let folder=(f.webkitRelativePath||f.name).split("/")[0];
+
+if(!grouped[folder]){
+grouped[folder]={
+name:folder,
+chapters:[],
+cover:null,
+playlist:null,
+currentChapter:0,
+currentTime:0,
+category:"Ostatní",
+favorite:false,
+createdAt:Date.now(),
+lastPlayed:0
+};
+}
+
+/* image fix */
+const isImage =
+f.type.startsWith("image") ||
+/\.(jpg|jpeg|png|webp|gif)$/i.test(f.name);
+
+const preferred = /cover|folder|front/i.test(f.name);
+
+if(isImage){
+if(!grouped[folder].cover || preferred){
+grouped[folder].cover = await f.arrayBuffer();
+}
+continue;
+}
+
+/* playlist */
+if(f.name.toLowerCase().endsWith(".m3u")){
+grouped[folder].playlist=await f.text();
+continue;
+}
+
+/* audio */
+if(f.type.startsWith("audio")){
+grouped[folder].chapters.push({
+name:f.name,
+data:await f.arrayBuffer()
+});
+}
+}
+
+/* sort */
+Object.values(grouped).forEach(b=>{
+if(b.playlist){
+let order=b.playlist.split("\n").map(l=>l.trim()).filter(l=>l&&!l.startsWith("#")).map(l=>l.split("/").pop().toLowerCase());
+
+b.chapters.sort((a,b)=>{
+let ai=order.indexOf(a.name.toLowerCase());
+let bi=order.indexOf(b.name.toLowerCase());
+
+if(ai===-1 && bi===-1)return a.name.localeCompare(b.name,undefined,{numeric:true});
+if(ai===-1)return 1;
+if(bi===-1)return -1;
+return ai-bi;
+});
+}else{
+b.chapters.sort((a,b)=>a.name.localeCompare(b.name,undefined,{numeric:true}));
+}
+
+saveBook(b);
+});
+
+loadBooks();
+};
+
+/* search */
+searchInput.oninput=()=>render();
+
+/* menu */
+function openMenu(x,y,book){
+menu.innerHTML="";
+menu.style.display="flex";
+menu.style.left=x+"px";
+menu.style.top=y+"px";
+
+categories.forEach(cat=>{
+let d=document.createElement("div");
+d.innerText="📂 "+cat;
+d.onclick=()=>{
+book.category=cat;
+saveBook(book);
+menu.style.display="none";
+render();
+};
+menu.appendChild(d);
+});
+
+let cover=document.createElement("div");
+cover.innerText="🖼 Změnit obrázek";
+cover.onclick=()=>{
+let input=document.createElement("input");
+input.type="file";
+input.accept="image/*";
+input.onchange=async ()=>{
+let file=input.files[0];
+if(file){
+book.cover=await file.arrayBuffer();
+book._coverUrl=null;
+saveBook(book);
+render();
+}
+};
+input.click();
+menu.style.display="none";
+};
+menu.appendChild(cover);
+
+let reset=document.createElement("div");
+reset.innerText="🔄 Reset přehrávání";
+reset.onclick=()=>{
+book.currentTime=0;
+book.currentChapter=0;
+saveBook(book);
+menu.style.display="none";
+};
+menu.appendChild(reset);
+
+let del=document.createElement("div");
+del.innerText="🗑 Smazat knihu";
+del.onclick=()=>{
+if(confirm("Opravdu smazat knihu?")){
+db.transaction("books","readwrite").objectStore("books").delete(book.name);
+menu.style.display="none";
+loadBooks();
+}
+};
+menu.appendChild(del);
+}
+
+window.onclick=(e)=>{
+if(!menu.contains(e.target)){
+menu.style.display="none";
+}
+};
+
+/* render */
+function render(){
+library.innerHTML="";
+let list=[...books];
+let q=searchInput.value.toLowerCase();
+
+if(selectedCategory==="🆕 Naposled přidané"){
+list.sort((a,b)=>b.createdAt-a.createdAt);
+}
+if(selectedCategory==="🕒 Naposled poslouchané"){
+list.sort((a,b)=>b.lastPlayed-a.lastPlayed);
+}
+if(selectedCategory==="⏱ Pokračovat"){
+list=list.filter(b=>b.currentTime>10||b.currentChapter>0);
+}
+
+list=list.filter(b=>{
+if(selectedCategory==="⭐ Oblíbené"&&!b.favorite)return false;
+if(categories.includes(selectedCategory)&&b.category!==selectedCategory)return false;
+if(q&&!b.name.toLowerCase().includes(q))return false;
+return true;
+});
+
+list.forEach(b=>{
+let div=document.createElement("div");
+div.className="book";
+
+let cover="";
+if(b.cover){
+if(!b._coverUrl){
+b._coverUrl=URL.createObjectURL(new Blob([b.cover]));
+}
+cover=b._coverUrl;
+}
+
+div.innerHTML=`
+${cover?`<img src="${cover}">`:`<div style="width:100%;height:100%;background:#333"></div>`}
+<div class="book-cat">📂 ${b.category}</div>
+<div class="book-title">${b.name}</div>
+<div class="fav">${b.favorite?"⭐":"☆"}</div>
+`;
+
+div.onclick=()=>play(b);
+
+div.querySelector(".fav").onclick=(e)=>{
+e.stopPropagation();
+b.favorite=!b.favorite;
+saveBook(b);
+render();
+};
+
+div.oncontextmenu=(e)=>{
+e.preventDefault();
+openMenu(e.pageX,e.pageY,b);
+};
+
+library.appendChild(div);
+});
+}
+
+/* play */
+function play(b){
+b.lastPlayed=Date.now();
+
+if(currentUrl) URL.revokeObjectURL(currentUrl);
+
+let ch=b.currentChapter||0;
+let t=b.currentTime||0;
+let chapter=b.chapters[ch];
+
+if(!chapter) return;
+
+currentUrl=URL.createObjectURL(new Blob([chapter.data]));
+
+audio.src=currentUrl;
+audio.currentTime=t;
+
+/* 🔥 SAFE PLAY */
+audio.play().catch(()=>{});
+
+/* 🍏 MEDIA SESSION */
+if ('mediaSession' in navigator) {
+navigator.mediaSession.metadata = new MediaMetadata({
+title: b.name,
+artist: chapter.name,
+album: "AudioFlow"
+});
+navigator.mediaSession.setActionHandler('play', () => audio.play());
+navigator.mediaSession.setActionHandler('pause', () => audio.pause());
+}
+
+nowPlaying.innerText=`🎧 ${b.name} — ${chapter.name}`;
+
+audio.ontimeupdate=()=>{
+b.currentTime=audio.currentTime;
+
+if(audio.duration){
+progressBar.style.width=(audio.currentTime/audio.duration*100)+"%";
+}
+
+saveBook(b);
+};
+
+audio.onended=()=>{
+if(b.currentChapter+1<b.chapters.length){
+b.currentChapter++;
+b.currentTime=0;
+play(b);
+}
+};
+}
+
+function skip(s){
+audio.currentTime+=s;
+}
+
+</script>
+
+</body>
+</html>
